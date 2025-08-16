@@ -1,0 +1,26 @@
+syntax = "proto3";
+
+package orchestrator.v1;
+
+option go_package = "github.com/EmilTsvetanov0/video-inference-service/api/gen/go/orchestrator/v1;orcv1";
+
+import "google/protobuf/empty.proto";
+
+message TerminateRunnerRequest {
+  string id = 1;
+  int64  timestamp = 2;
+  string error = 3;
+}
+message TerminateRunnerResponse {
+  string message = 1;
+}
+
+message HeartbeatRequest {
+  string id = 1;
+  int64  timestamp = 2;
+}
+
+service RunnerControl {
+  rpc Terminate (TerminateRunnerRequest) returns (TerminateRunnerResponse);
+  rpc Heartbeat (HeartbeatRequest) returns (google.protobuf.Empty);
+}

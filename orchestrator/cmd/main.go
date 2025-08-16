@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	orcv1 "github.com/Emiltsvetanov0/video-inference-service/api/gen/go/orchestrator/v1"
+	"github.com/spf13/viper"
+	"google.golang.org/grpc"
 	"log"
+	"net"
 	"orchestrator/internal/kafka"
 	"orchestrator/internal/postgresql"
 	pclient "orchestrator/internal/postgresql/client"
 	"orchestrator/internal/runners"
-	"orchestrator/internal/server"
+	server "orchestrator/internal/transport/grpc"
 	"os"
 	"os/signal"
 	"sync"
@@ -88,10 +92,22 @@ func main() {
 	}()
 
 	// Server init
-	client := server.New("8080", runnerPool)
 
-	if err := client.Run(); err != nil {
-		return
+	client := server.New(runnerPool)
+
+	addr := ":" + viper.GetString("server.port")
+
+	lis, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatalf("[orchestrator] Failed to listen %s: %v", addr, err)
+	}
+
+	s := grpc.NewServer()
+	orcv1.RegisterRunnerControlServer(s, client)
+
+	log.Printf("[orchestrator] gRPC listening on %s", addr)
+	if err := s.Serve(lis); err != nil {
+		log.Fatalf("[orchestrator] Failed to serve: %v", err)
 	}
 
 	wg.Wait()

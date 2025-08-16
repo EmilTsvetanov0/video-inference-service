@@ -5,9 +5,6 @@ kafka:
   assignor: roundrobin
   oldest: false
   verbose: true
-runner:
-  heartbeat_interval: 3
-  heartbeat_url: orchestrator:8080/ping
 postgresql:
   DATABASE_PORT: 5432
   DATABASE_USER: postgres

@@ -1,26 +1,31 @@
 package runner
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	orcv1 "github.com/Emiltsvetanov0/video-inference-service/api/gen/go/orchestrator/v1"
 	"github.com/spf13/viper"
 	"gocv.io/x/gocv"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 	"log"
-	"net/http"
 	"producer/internal/cconfig"
 	"producer/internal/domain"
 	"producer/internal/kafka"
-	"strconv"
 	"sync"
 	"time"
 )
 
-var hbInterval = 3 * time.Second
-var heartbeatURL = "http://localhost:8080/ping"
-var terminateURL = "http://localhost:8080/term"
-var hbTries = 5
-var frameSendInterval = 3000 * time.Millisecond
+var (
+	hbInterval        = 3 * time.Second
+	orchGRPCAddr      = "127.0.0.1:9090"
+	hbTries           = 5
+	frameSendInterval = 3000 * time.Millisecond
+	grpcOnce          sync.Once
+	grpcConn          *grpc.ClientConn
+	grpcCli           orcv1.RunnerControlClient
+	grpcMux           sync.Mutex
+)
 
 const videoFolder = "./files/"
 
@@ -29,9 +34,44 @@ func init() {
 
 	hbInterval = time.Duration(viper.GetInt("runner.heartbeat_interval")) * time.Second
 	frameSendInterval = time.Duration(viper.GetInt("runner.frame_interval_millis")) * time.Millisecond
-	heartbeatURL = "http://" + viper.GetString("runner.heartbeat_url")
-	terminateURL = "http://" + viper.GetString("runner.terminate_url")
+	orchGRPCAddr = viper.GetString("runner.orchestrator_grpc_addr")
 	hbTries = viper.GetInt("runner.heartbeat_tries")
+}
+
+func ensureGRPC(ctx context.Context) error {
+	var dialErr error
+	grpcOnce.Do(func() {
+		grpcMux.Lock()
+		defer grpcMux.Unlock()
+
+		if grpcConn != nil {
+			return
+		}
+		conn, err := grpc.DialContext(
+			ctx,
+			orchGRPCAddr,
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithBlock(),
+		)
+		if err != nil {
+			dialErr = err
+		}
+		grpcConn = conn
+		grpcCli = orcv1.NewRunnerControlClient(grpcConn)
+	})
+	return dialErr
+}
+
+func resetGRPC() {
+	grpcMux.Lock()
+	defer grpcMux.Unlock()
+	if grpcConn != nil {
+		_ = grpcConn.Close()
+		grpcConn = nil
+		grpcCli = nil
+	}
+
+	grpcOnce = sync.Once{}
 }
 
 type Runner struct {
@@ -84,39 +124,48 @@ func (r *Runner) Start(ctx context.Context) bool {
 					log.Println("[producer] [Runner.Start] Stopping heartbeat sending due to runner inactivity")
 					return
 				}
-				log.Printf("[producer] [Runner.Start] Sending heartbeat for %s", r.jobName)
-				payload := []byte(`{"id":"` + job + `","timestamp":` + strconv.FormatInt(time.Now().Unix(), 10) + `}`)
 
-				resp, err := http.Post(heartbeatURL, "application/json", bytes.NewBuffer(payload))
-				log.Printf("[producer] [Runner.Start] Heartbeat response code: %d", resp.StatusCode)
-				if err != nil || resp.StatusCode != http.StatusOK {
+				if grpcCli == nil {
+					dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+					err := ensureGRPC(dctx)
+					cancel()
 					if err != nil {
-						log.Println("[producer] [Runner.Start] Heartbeat send error:", err)
-					} else {
-						log.Println("[producer] [Runner.Start] Heartbeat send error: status code:", resp.StatusCode)
+						log.Printf("[producer] [Runner.Start] Heartbeat dial error: %v", err)
+						currentTries++
+						if currentTries >= hbTries {
+							log.Println("[producer] [Runner.Start] Heartbeat dial tries limit reached, cancelling runner")
+							r.Stop()
+							return
+						}
+						continue
 					}
+				}
+
+				log.Printf("[producer] [Runner.Start] Sending heartbeat for %s", r.jobName)
+				hctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+				_, err := grpcCli.Heartbeat(hctx, &orcv1.HeartbeatRequest{
+					Id:        job,
+					Timestamp: time.Now().Unix(),
+				})
+				cancel()
+
+				if err != nil {
+					log.Printf("[producer] [Runner.Start] Heartbeat error: %v", err)
 					currentTries++
 					if currentTries >= hbTries {
 						log.Println("[producer] [Runner.Start] Heartbeat tries limit reached, cancelling runner")
 						r.Stop()
-						err := resp.Body.Close()
-						if err != nil {
-							log.Printf("[producer] [Runner.Start] Close body response error: %s", err)
-							return
-						}
 						return
 					}
-				} else {
+					continue
+				}
+
+				if !started {
 					if !started {
 						started = true
 						startFrames <- struct{}{}
 					}
 					currentTries = 0
-				}
-				err = resp.Body.Close()
-				if err != nil {
-					log.Printf("[producer] [Runner.Start] Close body response error: %s", err)
-					return
 				}
 			}
 		}
@@ -135,7 +184,7 @@ func (r *Runner) Start(ctx context.Context) bool {
 		video, err := gocv.VideoCaptureFile(videoFolder + job + ".mp4")
 		if err != nil {
 			log.Println("[producer] [Runner.Start] VideoCaptureFile error:", err)
-			NotifyAboutStopping(job, err)
+			NotifyAboutStopping(ctx, job, err)
 			r.Stop()
 			return
 		}
@@ -163,7 +212,7 @@ func (r *Runner) Start(ctx context.Context) bool {
 					video, err = gocv.VideoCaptureFile(job + ".mp4")
 					if err != nil {
 						log.Println("[producer] [Runner.Start] VideoCaptureFile error:", err)
-						NotifyAboutStopping(job, err)
+						NotifyAboutStopping(ctx, job, err)
 						r.Stop()
 						return
 					}
@@ -255,22 +304,35 @@ func (p *Pool) Stop(id string) {
 	}
 }
 
-func NotifyAboutStopping(job string, err error) {
+func NotifyAboutStopping(ctx context.Context, job string, err error) {
 	log.Println("[producer] [NotifyAboutStopping]", err)
-	payload := []byte(`{"id":"` + job + `","timestamp":` + strconv.FormatInt(time.Now().Unix(), 10) + `, "error":"` + err.Error() + `"}`)
 
-	resp, err := http.Post(terminateURL, "application/json", bytes.NewBuffer(payload))
-	log.Printf("[producer] [NotifyAboutStopping] response code: %d", resp.StatusCode)
-	if err != nil || resp.StatusCode != http.StatusOK {
-		if err != nil {
-			log.Println("Notification send error:", err)
-		} else {
-			log.Println("Notification send error: status code:", resp.StatusCode)
-		}
+	if grpcCli == nil {
+		dctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+		_ = ensureGRPC(dctx)
+		cancel()
 	}
-	err = resp.Body.Close()
-	if err != nil {
-		log.Printf("[producer] [NotifyAboutStopping] Close body response error: %s", err)
+
+	if grpcCli == nil {
+		log.Printf("[producer] [NotifyAboutStopping] no gRPC client to notify (addr %s)", orchGRPCAddr)
 		return
 	}
+
+	tctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
+	_, callErr := grpcCli.Terminate(tctx, &orcv1.TerminateRunnerRequest{
+		Id:        job,
+		Timestamp: time.Now().Unix(),
+		Error:     err.Error(),
+	})
+
+	if callErr != nil {
+		log.Printf("[producer] [NotifyAboutStopping] gRPC terminate error: %v", callErr)
+		// сбросим, чтобы следующая попытка могла переподключиться
+		resetGRPC()
+		return
+	}
+
+	log.Printf("[producer] [NotifyAboutStopping] notified orchestrator about stop of %s", job)
 }

@@ -13,4 +13,4 @@ postgresql:
   DATABASE_HOST: orchestrator_db
   max_attempts: 5
 server:
-  port: 8080
+  port: 9090
