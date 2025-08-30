@@ -53,6 +53,7 @@ func NewScenario(id string, enterState func(ctx context.Context, id string, dst 
 			// ---- запуск ----
 			"enter_in_startup_processing": s.cbEnterStartupProcessing,
 			"before_complete_startup":     s.cbBeforeCompleteStartup,
+			"enter_active":                s.cbEnterActive,
 
 			// ---- остановка ----
 			"enter_init_shutdown":          s.cbEnterInitShutdown,
@@ -81,10 +82,6 @@ func (s *Scenario) cbEnterStartupProcessing(ctx context.Context, e *fsm.Event) {
 
 	s.rs.StartRunner(s.ID)
 
-	watchdogCtx, cancel := context.WithCancel(context.Background())
-	s.cancelHB = cancel
-	go s.heartbeatWatchdog(watchdogCtx)
-
 	go func() {
 		time.Sleep(100 * time.Millisecond)
 		if err := s.FSM.Event(context.Background(), "complete_startup"); err != nil {
@@ -102,12 +99,19 @@ func (s *Scenario) cbBeforeCompleteStartup(ctx context.Context, e *fsm.Event) {
 
 			go func() {
 				time.Sleep(100 * time.Millisecond)
+				s.SetNeedRestart(true)
 				if err := s.FSM.Event(context.Background(), "begin_shutdown"); err != nil {
 					log.Printf("[orchestrator] [%s] begin_shutdown triggered with error: %v", s.ID, err)
 				}
 			}()
 		}
 	}
+}
+
+func (s *Scenario) cbEnterActive(ctx context.Context, e *fsm.Event) {
+	watchdogCtx, cancel := context.WithCancel(context.Background())
+	s.cancelHB = cancel
+	go s.heartbeatWatchdog(watchdogCtx)
 }
 
 func (s *Scenario) cbEnterInitShutdown(ctx context.Context, e *fsm.Event) {
@@ -142,7 +146,7 @@ func (s *Scenario) cbEnterInactive(ctx context.Context, e *fsm.Event) {
 
 	if s.NeedRestart() {
 		log.Printf("[orchestrator] [%s] restarting scenario after going inactive", s.ID)
-		s.needRestart = false
+		s.SetNeedRestart(false)
 
 		go func() {
 			time.Sleep(100 * time.Millisecond)
@@ -225,9 +229,7 @@ func (s *Scenario) heartbeatWatchdog(ctx context.Context) {
 			expired := time.Since(lastHB) > HeartbeatTTL
 
 			currentState := s.FSM.Current()
-			if expired && (currentState == StActive || currentState == StInStartupProcessing) &&
-				currentState != StInitShutdown &&
-				currentState != StInShutdownProcessing {
+			if expired && currentState == StActive {
 				log.Printf("[orchestrator] [%s] watchdog check: state=%s, lastHB=%v",
 					s.ID, s.FSM.Current(), time.Since(s.lastHB))
 
